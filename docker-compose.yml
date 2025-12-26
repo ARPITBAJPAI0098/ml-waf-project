@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: ml_waf_postgres
+    environment:
+      POSTGRES_DB: ml_waf_db
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d ml_waf_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ml_waf_redis
+    ports:
+      - "6379:6379"
+
+  backend:
+  
+    build: ./backend
+    image: ml-waf-backend:latest
+    container_name: ml_waf_backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://admin:password123@postgres:5432/ml_waf_db
+      MODEL_PATH: /app/models/ml_waf_model.pkl
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./backend:/app   # 🔥 important for live reload
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build: ./frontend
+    image: ml-waf-frontend:latest
+    container_name: ml_waf_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - backend
+    command: npm run dev
+
+volumes:
+  postgres_data:
