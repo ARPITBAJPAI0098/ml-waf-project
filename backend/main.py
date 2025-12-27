@@ -99,18 +99,18 @@ async def analyze_request(request: HTTPRequest, background_tasks: BackgroundTask
                 request_id=request_id
             )
 
-        # 🔹 STEP 2: ML feature extraction
-        features = ml_model.extract_features(
-            method=request.method,
-            path=request.path,
-            headers=request.headers,
-            body=request.body,
-            ip_address=request.ip_address,
-            user_agent=request.user_agent
-        )
+        # 🔹 STEP 2: Build traffic object
+        traffic = {
+            "method": request.method,
+            "path": request.path,
+            "headers": request.headers,
+            "body": request.body,
+            "ip_address": request.ip_address,
+            "user_agent": request.user_agent
+        }
 
-        # 🔹 STEP 3: ML prediction
-        is_malicious, confidence, threat_type = ml_model.predict(features)
+        # 🔹 STEP 3: ML prediction (FeatureExtractor used internally)
+        is_malicious, confidence, threat_type = ml_model.predict(traffic)
 
         # 🔹 STEP 4: Log request
         log_entry = RequestLog(

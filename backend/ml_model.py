@@ -7,6 +7,7 @@ import os
 import re
 from typing import Tuple, Dict
 import datetime
+from feature_extractor import FeatureExtractor
 
 class MLWAFModel:
     def __init__(self, model_path="/app/models/ml_waf_model.pkl"):
@@ -15,106 +16,56 @@ class MLWAFModel:
         self.scaler = StandardScaler()
         self.is_trained = False
         self.last_trained_time = None
-        self.feature_count = 15
-        
-        self.sql_patterns = [
-            r"(union.*select)", r"(select.*from)", r"(insert.*into)",
-            r"(delete.*from)", r"(drop.*table)", r"('.*or.*'.*=.*')",
-            r"(;.*--)", r"(\/\*.*\*\/)"
-        ]
-        
-        self.xss_patterns = [
-            r"(<script)", r"(javascript:)", r"(onerror=)", r"(onload=)",
-            r"(<iframe)", r"(eval\()", r"(alert\()"
-        ]
-        
-        self.path_traversal = [
-            r"(\.\./)", r"(\.\.\\)", r"(/etc/passwd)", r"(c:\\windows)"
-        ]
+        self.feature_count = 35
+        self.feature_extractor = FeatureExtractor()
+        self.feature_keys = None  # to lock feature order
     
-    def extract_features(self, method: str, path: str, headers: Dict, 
-                        body: str, ip_address: str, user_agent: str) -> np.ndarray:
-        features = []
+    def build_feature_vector(self, traffic: Dict) -> np.ndarray:
         
-        features.append(len(path))
-        features.append(path.count('/'))
-        
-        query_len = len(path.split('?')[1]) if '?' in path else 0
-        features.append(query_len)
-        
-        param_count = path.count('&') + (1 if '?' in path else 0)
-        features.append(param_count)
-        
-        special_chars = sum(1 for c in path if not c.isalnum() and c not in ['/', '?', '&', '='])
-        features.append(special_chars)
-        
-        sql_score = sum(1 for pattern in self.sql_patterns 
-                       if re.search(pattern, path.lower() + body.lower()))
-        features.append(sql_score)
-        
-        xss_score = sum(1 for pattern in self.xss_patterns 
-                       if re.search(pattern, path.lower() + body.lower()))
-        features.append(xss_score)
-        
-        traversal_score = sum(1 for pattern in self.path_traversal 
-                             if re.search(pattern, path.lower()))
-        features.append(traversal_score)
-        
-        features.append(len(body))
-        features.append(len(headers))
-        
-        method_map = {'GET': 0, 'POST': 1, 'PUT': 2, 'DELETE': 3}
-        features.append(method_map.get(method.upper(), 4))
-        
-        suspicious_ua = int(any(x in user_agent.lower() for x in ['bot', 'crawler', 'scanner']))
-        features.append(suspicious_ua)
-        
-        entropy = self._calculate_entropy(path)
-        features.append(entropy)
-        
-        numeric_ratio = sum(c.isdigit() for c in path) / max(len(path), 1)
-        features.append(numeric_ratio)
-        
-        has_extension = int('.' in path.split('/')[-1])
-        features.append(has_extension)
-        
-        return np.array(features).reshape(1, -1)
+    # 1. Extract features using FeatureExtractor
+        feature_dict = self.feature_extractor.extract(traffic)
+
+        # 2. Fix feature order ONCE
+        if self.feature_keys is None:
+            self.feature_keys = sorted(feature_dict.keys())
+
+        # 3. Build feature vector in fixed order
+        feature_vector = [feature_dict[k] for k in self.feature_keys]
+
+        # 4. Convert to numpy array
+        return np.array(feature_vector).reshape(1, -1)
     
-    def _calculate_entropy(self, text: str) -> float:
-        if not text:
-            return 0
-        entropy = 0
-        for c in set(text):
-            p = text.count(c) / len(text)
-            entropy -= p * np.log2(p)
-        return entropy
-    
-    def predict(self, features: np.ndarray) -> Tuple[bool, float, str]:
+    def predict(self, traffic: Dict):
+        features = self.build_feature_vector(traffic)
+
         if not self.is_trained:
             return self._rule_based_detection(features)
-        
+
         features_scaled = self.scaler.transform(features)
         prediction = self.model.predict(features_scaled)[0]
         anomaly_score = self.model.score_samples(features_scaled)[0]
+
         confidence = abs(anomaly_score)
-        
         is_malicious = prediction == -1
         threat_type = self._classify_threat(features[0]) if is_malicious else "benign"
-        
+
         return is_malicious, confidence, threat_type
-    
-    def _rule_based_detection(self, features: np.ndarray) -> Tuple[bool, float, str]:
+
+    def _rule_based_detection(self, features: np.ndarray):
         f = features[0]
-        
-        if f[5] > 0:
+
+        # Update indexes after first run print
+        SQL_IDX = self.feature_keys.index('sql_injection_score')
+        XSS_IDX = self.feature_keys.index('xss_score')
+        PATH_IDX = self.feature_keys.index('path_traversal_score')
+
+        if f[SQL_IDX] > 0:
             return True, 0.9, "sql_injection"
-        if f[6] > 0:
+        if f[XSS_IDX] > 0:
             return True, 0.85, "xss"
-        if f[7] > 0:
+        if f[PATH_IDX] > 0:
             return True, 0.88, "path_traversal"
-        if f[0] > 200 or f[4] > 20:
-            return True, 0.7, "suspicious_pattern"
-        
+
         return False, 0.95, "benign"
     
     def _classify_threat(self, features: np.ndarray) -> str:
@@ -171,25 +122,57 @@ class MLWAFModel:
         normal_data = []
         for _ in range(1000):
             features = [
-                np.random.randint(10, 50),
-                np.random.randint(1, 5),
-                np.random.randint(0, 30),
-                np.random.randint(0, 5),
-                np.random.randint(0, 5),
-                0, 0, 0,
-                np.random.randint(0, 100),
-                np.random.randint(5, 15),
-                0,
-                0,
-                np.random.uniform(2, 4),
-                np.random.uniform(0, 0.3),
-                1
+                # Basic features (4)
+                np.random.randint(0, 6),      # method_encoded
+                np.random.randint(10, 50),    # path_length
+                np.random.randint(0, 1000),   # content_length
+                np.random.randint(0, 5),      # query_param_count
+                
+                # Path features (4)
+                np.random.uniform(2, 4),      # path_entropy
+                np.random.uniform(0, 0.3),    # special_char_ratio
+                np.random.uniform(0, 0.2),    # digit_ratio
+                np.random.uniform(0, 0.1),    # upper_ratio
+                
+                # Header features (6)
+                np.random.randint(5, 20),     # num_headers
+                np.random.randint(50, 200),   # user_agent_length
+                np.random.randint(0, 2),      # has_referer
+                np.random.randint(0, 5),      # cookie_count
+                np.random.randint(0, 2),      # accept_header_present
+                np.random.randint(0, 2),      # authorization_present
+                
+                # Attack patterns (6)
+                0,                             # sql_injection_score
+                0,                             # xss_score
+                0,                             # has_sql_keywords
+                0,                             # has_xss_patterns
+                0,                             # path_traversal_score
+                0,                             # command_injection_score
+                
+                # Time features (2)
+                np.random.randint(0, 24),     # hour
+                np.random.randint(0, 7),      # day_of_week
+                
+                # Security features (13)
+                0,                             # requests_per_minute
+                0,                             # content_type_encoded
+                0,                             # suspicious_header_count
+                0,                             # unusual_port
+                np.random.uniform(0.3, 0.7),  # ip_reputation_score
+                np.random.uniform(0, 0.2),    # geo_risk_score
+                0,                             # known_bot_ua
+                np.random.randint(100, 2000), # request_size_total
+                0,                             # header_order_anomaly
+                1,                             # protocol_version_encoded
+                np.random.uniform(0.7, 1.0),  # cipher_strength
+                3,                             # tls_version_encoded
+                1,                             # cert_valid
             ]
             normal_data.append(features)
         
         X = np.array(normal_data)
         self.train(X)
-        print("Model trained with sample data")
-    
+        print(f"Model trained with sample data - {X.shape[1]} features")
     def retrain(self):
         self._train_with_sample_data()
